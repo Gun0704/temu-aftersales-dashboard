@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.streamlit/secrets.toml
+aftersales_dashboard/**/__pycache__/
+marketing_dashboard/**/__pycache__/
+EM04W36.24-40932112123888-36740224011495露营灯退货/
+*退货/
+data/raw/*
+data/processed/*
+data/exports/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/exports/.gitkeep

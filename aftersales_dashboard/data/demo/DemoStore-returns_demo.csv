@@ -1,0 +1,3 @@
+Store,Return ID,Order ID,Return status,SKU ID,Reason for request,Return quantity,Amount request to refund,Amount refund to buyer,Order date,Requested date,Types of after-sales service
+DemoStore,R-10001,900010,Refunded,SKU-BAG-001,Product damaged but shipping box ok,1,68.0,68.0,2026-06-05,2026-06-08,Return and refund
+DemoStore,R-10002,900025,Not refunded yet,SKU-LAMP-002,No longer need,1,125.0,0.0,2026-06-09,2026-06-11,Returnless refund

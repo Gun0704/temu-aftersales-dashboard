@@ -1,0 +1,886 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+import pandas as pd
+import streamlit as st
+
+from marketing_dashboard.analytics.advanced_analytics import (
+    build_diagnostic_actions,
+    build_dimension_summary,
+    extra_rows_to_df,
+    merge_extra_metrics,
+)
+from marketing_dashboard.analytics.metrics import (
+    build_alerts,
+    build_analysis_text,
+    build_daily_dataset,
+    build_daily_detail_dataset,
+    build_sku_tables,
+    build_tag_snapshot,
+    safe_divide,
+)
+from marketing_dashboard.analytics.returns import (
+    build_return_export_file,
+    build_return_summary,
+    clean_return_df,
+    filter_return_df,
+    format_return_display_df,
+)
+from marketing_dashboard.core.config import (
+    DEFAULT_CONVERSION_BASIS,
+    DEFAULT_INDUSTRY_CONVERSION,
+    DEFAULT_INDUSTRY_CTR,
+    QUICK_TAG_OPTIONS,
+)
+from marketing_dashboard.data.cleaners import clean_sales_df, clean_traffic_df, clean_mapping_df
+from marketing_dashboard.data.frontend_orders import (
+    build_frontend_daily_dataset,
+    enrich_frontend_order_df,
+    load_frontend_order_df,
+)
+from marketing_dashboard.data.local_files import collect_local_data_inputs, local_data_summary
+from marketing_dashboard.data.pipeline import compute_base_datasets, load_table_from_bytes, process_inputs
+from marketing_dashboard.integrations.temu_api import (
+    TemuApiClient,
+    TemuApiConfig,
+    mapping_rows_to_df,
+    sales_rows_to_df,
+    traffic_rows_to_df,
+)
+from marketing_dashboard.ui.components import (
+    build_metric_tooltip,
+    extract_goods_ids,
+    inject_metric_card_style,
+    render_metric_card,
+)
+from marketing_dashboard.ui.helpers import (
+    build_export_file,
+    format_pct,
+    pick_existing_columns,
+    style_daily_detail_table,
+)
+from marketing_dashboard.viz.charts import (
+    make_clicks_conversion_chart,
+    make_frontend_price_sales_chart,
+    make_impressions_ctr_chart,
+)
+
+
+def main() -> None:
+    st.set_page_config(page_title="营销数据看板", layout="wide")
+    st.title("营销数据看板")
+
+    inject_metric_card_style()
+    st.caption("基于重构版架构：数据层、分析层、可视化层、集成层和 UI 层已拆分；支持上传、TEMU API 和本地演示数据。")
+
+    with st.sidebar:
+        st.header("数据来源")
+        data_source = st.radio("选择取数方式", ["本地演示数据", "上传文件", "TEMU API", "上传 + TEMU API"], horizontal=False)
+
+        sales_files = traffic_files = mapping_files = frontend_order_file = return_files = all_data_files = None
+        api_sales_df = pd.DataFrame()
+        api_traffic_df = pd.DataFrame()
+        api_mapping_df = pd.DataFrame()
+        api_extra_df = pd.DataFrame()
+        local_inputs = {"sales": [], "traffic": [], "mapping": [], "mixed": [], "returns": [], "frontend_order": None}
+
+        if data_source == "本地演示数据":
+            st.subheader("本地演示数据")
+            local_data_dir = st.text_input("数据目录", value="data/demo", help="可改为 data/raw 使用提前下载的真实数据。")
+            local_inputs = collect_local_data_inputs(local_data_dir)
+            st.caption(local_data_summary(local_inputs))
+            if not any([local_inputs.get("sales"), local_inputs.get("traffic"), local_inputs.get("mixed")]):
+                st.warning("当前目录未识别到销售/流量数据。请先运行 scripts/make_demo_data.py 或 scripts/download_temu_data.py。")
+
+        if data_source in ["上传文件", "上传 + TEMU API"]:
+            st.subheader("文件上传")
+            sales_files = st.file_uploader("批量上传销售表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+            traffic_files = st.file_uploader("批量上传流量表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+            mapping_files = st.file_uploader("批量上传商品信息表 / SKU映射表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+            frontend_order_file = st.file_uploader("上传前端价订单导出表", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
+            return_files = st.file_uploader("上传售后退货报表 / Return report", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+            all_data_files = st.file_uploader("或一次性混合上传（自动识别销售/流量）", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+
+        if data_source in ["TEMU API", "上传 + TEMU API"]:
+            st.subheader("TEMU API 自动取数")
+            api_start = st.date_input("API开始日期", value=date.today() - timedelta(days=7))
+            api_end = st.date_input("API结束日期", value=date.today())
+            sales_api_type = st.text_input("销售/订单接口 type", value=st.secrets.get("TEMU", {}).get("SALES_API_TYPE", ""))
+            traffic_api_type = st.text_input("流量接口 type", value=st.secrets.get("TEMU", {}).get("TRAFFIC_API_TYPE", ""))
+            mapping_api_type = st.text_input("商品/SKU接口 type", value=st.secrets.get("TEMU", {}).get("MAPPING_API_TYPE", ""))
+            with st.expander("高级 API 接口（可选，用于更细维度）"):
+                st.caption("这些接口不是必须项。只要返回里包含加购、库存、退款、价格、成本等字段，系统会自动识别并进入高级诊断。")
+                extra_api_types_text = st.text_area(
+                    "更多接口 type，每行一个",
+                    value=st.secrets.get("TEMU", {}).get("EXTRA_API_TYPES", ""),
+                    placeholder="例如：\n商品经营分析接口type\n库存接口type\n售后退款接口type",
+                )
+                page_size = st.number_input("每页条数", min_value=20, max_value=500, value=int(st.secrets.get("TEMU", {}).get("PAGE_SIZE", 100)), step=20)
+                max_pages = st.number_input("最大页数", min_value=1, max_value=500, value=int(st.secrets.get("TEMU", {}).get("MAX_PAGES", 50)), step=5)
+            if st.button("从 TEMU 拉取数据", type="primary"):
+                temu_cfg = st.secrets.get("TEMU", {})
+                required = ["APP_KEY", "APP_SECRET", "ACCESS_TOKEN", "BASE_URL"]
+                missing = [k for k in required if not temu_cfg.get(k)]
+                if missing:
+                    st.error("缺少 TEMU 配置：" + "、".join(missing))
+                elif not sales_api_type or not traffic_api_type:
+                    st.error("请填写销售/订单接口 type 和流量接口 type。")
+                else:
+                    client = TemuApiClient(TemuApiConfig(
+                        app_key=temu_cfg["APP_KEY"],
+                        app_secret=temu_cfg["APP_SECRET"],
+                        access_token=temu_cfg["ACCESS_TOKEN"],
+                        base_url=temu_cfg["BASE_URL"],
+                    ))
+                    common_payload = {"startDate": str(api_start), "endDate": str(api_end)}
+                    try:
+                        with st.spinner("正在从 TEMU API 拉取数据..."):
+                            sales_rows = client.call_pages(sales_api_type, common_payload, page_size=int(page_size), max_pages=int(max_pages))
+                            traffic_rows = client.call_pages(traffic_api_type, common_payload, page_size=int(page_size), max_pages=int(max_pages))
+                            mapping_rows = client.call_pages(mapping_api_type, {}, page_size=int(page_size), max_pages=int(max_pages)) if mapping_api_type else []
+                            # 高级接口按同一日期范围拉取；如果是库存类接口不需要日期，TEMU通常会忽略多余参数。
+                            extra_rows = []
+                            extra_api_types = [x.strip() for x in extra_api_types_text.splitlines() if x.strip()]
+                            for extra_type in extra_api_types:
+                                extra_rows.extend(client.call_pages(extra_type, common_payload, page_size=int(page_size), max_pages=int(max_pages)))
+                        st.session_state["api_sales_raw"] = sales_rows_to_df(sales_rows)
+                        st.session_state["api_traffic_raw"] = traffic_rows_to_df(traffic_rows)
+                        st.session_state["api_mapping_raw"] = mapping_rows_to_df(mapping_rows) if mapping_rows else pd.DataFrame()
+                        st.session_state["api_extra_raw"] = extra_rows_to_df(extra_rows) if extra_rows else pd.DataFrame()
+                        st.success(f"API拉取完成：销售 {len(sales_rows):,} 行，流量 {len(traffic_rows):,} 行，商品映射 {len(mapping_rows):,} 行，高级指标 {len(extra_rows):,} 行")
+                    except Exception as exc:
+                        st.error(f"TEMU API 拉取失败：{exc}")
+
+            api_sales_df = st.session_state.get("api_sales_raw", pd.DataFrame())
+            api_traffic_df = st.session_state.get("api_traffic_raw", pd.DataFrame())
+            api_mapping_df = st.session_state.get("api_mapping_raw", pd.DataFrame())
+            api_extra_df = st.session_state.get("api_extra_raw", pd.DataFrame())
+            if not api_extra_df.empty:
+                st.caption(f"已载入高级 API 指标：{len(api_extra_df):,} 行")
+        conversion_basis = st.selectbox("订单口径", ["订单商品数", "买家数", "下单件数"], index=["订单商品数", "买家数", "下单件数"].index(DEFAULT_CONVERSION_BASIS))
+        industry_ctr = st.slider("CTR参考值", min_value=0.0, max_value=0.30, value=DEFAULT_INDUSTRY_CTR, step=0.005, format="%.3f")
+        industry_conversion = st.slider("转化率参考值", min_value=0.0, max_value=0.50, value=DEFAULT_INDUSTRY_CONVERSION, step=0.005, format="%.3f")
+        st.markdown("---")
+        st.markdown("**说明**")
+        st.write("- 支持多店铺、多日期批量上传")
+        st.write("- 自动按字段识别销售表和流量表")
+        st.write("- Goods ID 统一匹配，SKU 优先展示，未匹配回退 Goods ID")
+        st.write("- 售后退货报表支持店铺 / SKU ID / 状态 / 原因 / 日期筛选，并可导出 Excel")
+        st.write("- API 模式支持扩展加购、库存、退款、价格、成本等细维度诊断")
+
+    has_upload_data = bool(sales_files or traffic_files or all_data_files or local_inputs.get("sales") or local_inputs.get("traffic") or local_inputs.get("mixed"))
+    has_api_data = not api_sales_df.empty and not api_traffic_df.empty
+    if not has_upload_data and not has_api_data:
+        st.info("请先上传销售表和流量表，或点击“从 TEMU 拉取数据”。商品信息表可选但建议提供。")
+        st.stop()
+
+    def _collect_inputs(files) -> list[tuple[str, bytes]]:
+        return [(f.name, f.getvalue()) for f in files] if files else []
+
+    sales_inputs = list(local_inputs.get("sales") or []) + _collect_inputs(sales_files)
+    traffic_inputs = list(local_inputs.get("traffic") or []) + _collect_inputs(traffic_files)
+    mapping_inputs = list(local_inputs.get("mapping") or []) + _collect_inputs(mapping_files)
+    mixed_inputs = list(local_inputs.get("mixed") or []) + _collect_inputs(all_data_files)
+    frontend_order_input = local_inputs.get("frontend_order") or ((frontend_order_file.name, frontend_order_file.getvalue()) if frontend_order_file else None)
+    return_inputs = list(local_inputs.get("returns") or []) + _collect_inputs(return_files)
+
+    try:
+        sales_df, traffic_df, mapping_df, messages, unknown_files = process_inputs(
+            sales_inputs, traffic_inputs, mapping_inputs, mixed_inputs
+        )
+        if not api_sales_df.empty:
+            api_clean_sales = clean_sales_df(api_sales_df, "TEMU_API")
+            sales_df = pd.concat([sales_df, api_clean_sales], ignore_index=True) if not sales_df.empty else api_clean_sales
+            messages.append(f"TEMU API销售数据载入 {len(api_clean_sales):,} 行")
+        if not api_traffic_df.empty:
+            api_clean_traffic = clean_traffic_df(api_traffic_df, "TEMU_API")
+            traffic_df = pd.concat([traffic_df, api_clean_traffic], ignore_index=True) if not traffic_df.empty else api_clean_traffic
+            messages.append(f"TEMU API流量数据载入 {len(api_clean_traffic):,} 行")
+        if not api_mapping_df.empty:
+            api_clean_mapping = clean_mapping_df(api_mapping_df, "TEMU_API")
+            mapping_df = pd.concat([mapping_df, api_clean_mapping], ignore_index=True) if not mapping_df.empty else api_clean_mapping
+            mapping_df = mapping_df.sort_values(["goods_id", "inventory_qty"], ascending=[True, False]).drop_duplicates("goods_id")
+            messages.append(f"TEMU API商品映射载入 {len(api_clean_mapping):,} 个 Goods ID")
+        if unknown_files:
+            st.warning("以下文件未识别：" + "、".join(unknown_files[:10]) + (" ..." if len(unknown_files) > 10 else ""))
+    except Exception as exc:
+        st.error(f"数据读取或清洗失败：{exc}")
+        st.stop()
+
+    for msg in messages:
+        st.success(msg)
+
+    frontend_order_df = pd.DataFrame()
+    frontend_match_stats = {"total_rows": 0, "mapped_rows": 0, "mapped_ratio": 0.0, "sku_hit_rows": 0, "name_hit_rows": 0}
+    return_df = pd.DataFrame()
+    if return_inputs:
+        try:
+            return_parts = [clean_return_df(load_table_from_bytes(name, content), name) for name, content in return_inputs]
+            return_df = pd.concat(return_parts, ignore_index=True) if return_parts else pd.DataFrame()
+            st.success(f"售后退货报表载入成功，共 {len(return_inputs)} 个文件、{len(return_df):,} 行")
+        except Exception as exc:
+            st.warning(f"售后退货报表读取失败，本次将不展示模块 6：{exc}")
+            return_df = pd.DataFrame()
+
+    if frontend_order_input:
+        try:
+            frontend_order_df = load_frontend_order_df(frontend_order_input[0], frontend_order_input[1])
+            frontend_order_df, frontend_match_stats = enrich_frontend_order_df(frontend_order_df, sales_df, traffic_df, mapping_df)
+            st.success(f"前端价订单表载入成功（支持 CSV / Excel），清洗后共 {len(frontend_order_df):,} 行")
+            st.caption(f"前端订单映射成功率：{frontend_match_stats['mapped_ratio']:.1%}（SKU直连 {frontend_match_stats['sku_hit_rows']:,} 行，商品名映射 {frontend_match_stats['name_hit_rows']:,} 行）")
+        except Exception as exc:
+            st.warning(f"前端价订单表读取失败，本次将不展示前端价格销量走势图：{exc}")
+            frontend_order_df = pd.DataFrame()
+
+    try:
+        detail_df, match_summary, match_details = compute_base_datasets(sales_df, traffic_df, mapping_df, conversion_basis)
+        has_advanced_api_data = 'api_extra_df' in locals() and not api_extra_df.empty
+        advanced_df = merge_extra_metrics(detail_df, api_extra_df) if has_advanced_api_data else merge_extra_metrics(detail_df, pd.DataFrame())
+    except Exception as exc:
+        st.error(f"数据合并失败：{exc}")
+        st.stop()
+
+    if detail_df.empty:
+        st.warning("清洗后没有可用数据，请检查日期、Goods ID 或文件类型。")
+        st.stop()
+
+    min_date = detail_df["date"].min().date()
+    max_date = detail_df["date"].max().date()
+    default_start = max(min_date, (detail_df["date"].max() - pd.Timedelta(days=6)).date())
+
+    # 售后报表通常没有店铺字段，店铺筛选默认来自报表字段或文件名；
+    # 如果平台导出的文件名只是 return_report，可在侧边栏手动归入某个项目店铺。
+    valid_return_assignment_stores = sorted({
+        str(x).strip() for x in detail_df.get("store", pd.Series(dtype="object")).dropna().astype(str).tolist()
+        if str(x).strip() and str(x).strip().casefold() not in {"0", "0.0", "nan", "none", "null", "<na>", "未分类店铺"}
+    })
+    if not return_df.empty:
+        with st.sidebar:
+            return_store_assignment = st.selectbox(
+                "售后报表店铺归属",
+                ["按报表字段/文件名自动识别"] + [f"全部归入：{store}" for store in valid_return_assignment_stores],
+                index=0,
+                help="Return report 如果没有店铺列，系统只能从文件名推断；文件名为 return_report 时会显示为未识别店铺。这里可手动把本次售后报表归入指定店铺。",
+            )
+        if return_store_assignment.startswith("全部归入："):
+            return_df = return_df.copy()
+            return_df["store"] = return_store_assignment.split("：", 1)[1]
+
+    st.markdown("## 模块 1：筛选与核心指标区")
+    with st.container(border=True):
+        filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns([1.15, 1.05, 1.8, 1.0, 1.1])
+        with filter_col1:
+            valid_stores = sorted({s for s in detail_df["store"].dropna().astype(str).tolist() if s.strip() and s.strip().casefold() not in {"0", "0.0", "nan", "none", "null", "<na>", "未分类店铺"}})
+            store_options = ["全部店铺"] + valid_stores
+            selected_store = st.selectbox("店铺", store_options, index=0)
+        with filter_col2:
+            product_mode = st.selectbox("产品筛选", ["全部产品", "按 Goods ID", "按 SKU"], index=0)
+        with filter_col3:
+            base_df = detail_df if selected_store == "全部店铺" else detail_df[detail_df["store"] == selected_store]
+            product_tag_df = build_tag_snapshot(base_df) if not base_df.empty else pd.DataFrame()
+            tag_priority = {"大爆款": 1, "爆款": 2, "旺款": 3, "上升趋势品": 4, "新品": 5, "常规款": 6, "滞制品": 7}
+
+            def _pick_main_tag(tag_text: str) -> str:
+                raw = str(tag_text or "").strip()
+                if not raw:
+                    return "未分类"
+                candidates = []
+                if "大爆款" in raw:
+                    candidates.append("大爆款")
+                if "爆款" in raw and "大爆款" not in raw:
+                    candidates.append("爆款")
+                if "旺款" in raw:
+                    candidates.append("旺款")
+                if "上升趋势品" in raw or "↑" in raw:
+                    candidates.append("上升趋势品")
+                if "新品" in raw:
+                    candidates.append("新品")
+                if "常规款" in raw:
+                    candidates.append("常规款")
+                if "滞制品" in raw:
+                    candidates.append("滞制品")
+                return sorted(set(candidates), key=lambda x: tag_priority.get(x, 99))[0] if candidates else raw.replace("↑", "").strip() or "未分类"
+
+            goods_id_options = sorted(base_df["goods_id"].dropna().astype(str).loc[lambda s: s.str.strip() != ""].unique().tolist())
+            frontend_sku_goods_df = pd.DataFrame(columns=["display_sku", "goods_id"])
+            if not frontend_order_df.empty and {"display_sku", "goods_id"}.issubset(frontend_order_df.columns):
+                frontend_sku_goods_df = frontend_order_df[["display_sku", "goods_id"]].copy()
+                frontend_sku_goods_df["display_sku"] = frontend_sku_goods_df["display_sku"].astype(str).str.strip()
+                frontend_sku_goods_df["goods_id"] = frontend_sku_goods_df["goods_id"].astype(str).str.strip()
+                frontend_sku_goods_df = frontend_sku_goods_df[(frontend_sku_goods_df["display_sku"] != "") & (frontend_sku_goods_df["goods_id"] != "")]
+                if selected_store != "全部店铺":
+                    base_goods_ids = set(base_df["goods_id"].astype(str).unique().tolist())
+                    frontend_sku_goods_df = frontend_sku_goods_df[frontend_sku_goods_df["goods_id"].isin(base_goods_ids)]
+                frontend_sku_goods_df = frontend_sku_goods_df.drop_duplicates()
+
+            fallback_sku_goods_df = base_df[["display_sku", "goods_id"]].copy()
+            fallback_sku_goods_df["display_sku"] = fallback_sku_goods_df["display_sku"].astype(str).str.strip()
+            fallback_sku_goods_df["goods_id"] = fallback_sku_goods_df["goods_id"].astype(str).str.strip()
+            fallback_sku_goods_df = fallback_sku_goods_df[(fallback_sku_goods_df["display_sku"] != "") & (fallback_sku_goods_df["goods_id"] != "")].drop_duplicates()
+
+            sku_goods_df = frontend_sku_goods_df if not frontend_sku_goods_df.empty else fallback_sku_goods_df
+            sku_options_all = sorted(sku_goods_df["display_sku"].astype(str).unique().tolist()) if not sku_goods_df.empty else []
+
+            product_tag_df = product_tag_df.copy() if not product_tag_df.empty else pd.DataFrame()
+            if not product_tag_df.empty:
+                product_tag_df["main_tag"] = product_tag_df["tag_short"].apply(_pick_main_tag)
+            goods_tag_map = product_tag_df.drop_duplicates("goods_id").set_index("goods_id")["main_tag"].to_dict() if not product_tag_df.empty else {}
+            sku_goods_map = sku_goods_df.drop_duplicates(subset=["display_sku"], keep="first").set_index("display_sku")["goods_id"].to_dict() if not sku_goods_df.empty else {}
+
+            if product_mode == "按 Goods ID":
+                goods_id_label_map = {key: f"{key} ｜ {goods_tag_map.get(key, '未分类')}" for key in goods_id_options}
+                selected_goods_id = st.selectbox(
+                    "选择 Goods ID",
+                    ["全部Goods ID"] + goods_id_options,
+                    index=0,
+                    format_func=lambda x: x if x == "全部Goods ID" else goods_id_label_map.get(x, x),
+                )
+                selected_sku = "全部SKU"
+            elif product_mode == "按 SKU":
+                sub_col1, sub_col2 = st.columns(2)
+                goods_id_label_map = {key: f"{key} ｜ {goods_tag_map.get(key, '未分类')}" for key in goods_id_options}
+                with sub_col1:
+                    selected_goods_id = st.selectbox(
+                        "联动 Goods ID（可选）",
+                        ["全部Goods ID"] + goods_id_options,
+                        index=0,
+                        format_func=lambda x: x if x == "全部Goods ID" else goods_id_label_map.get(x, x),
+                    )
+                if selected_goods_id != "全部Goods ID" and not sku_goods_df.empty:
+                    linked_sku_options = sorted(
+                        sku_goods_df.loc[sku_goods_df["goods_id"] == str(selected_goods_id), "display_sku"].astype(str).unique().tolist()
+                    )
+                else:
+                    linked_sku_options = sku_options_all
+                sku_label_map = {
+                    key: f"{key} ｜ {goods_tag_map.get(sku_goods_map.get(key, ''), '未分类')} ｜ Goods {sku_goods_map.get(key, '-') }"
+                    for key in linked_sku_options
+                }
+                with sub_col2:
+                    selected_sku = st.selectbox(
+                        "选择 SKU",
+                        ["全部SKU"] + linked_sku_options,
+                        index=0,
+                        format_func=lambda x: x if x == "全部SKU" else sku_label_map.get(x, x),
+                    )
+            else:
+                st.selectbox("选择 Goods ID / SKU", ["全部产品"], index=0, disabled=True)
+                selected_goods_id = "全部Goods ID"
+                selected_sku = "全部SKU"
+        with filter_col4:
+            selected_dates = st.date_input("日期范围", value=(default_start, max_date), min_value=min_date, max_value=max_date)
+        quick_tag_options = ["全部标签", "核心爆款", "上升趋势品", "滞制品", "大爆款", "爆款", "旺款", "常规款", "新品"]
+        with filter_col5:
+            selected_tag = st.selectbox("快捷标签", quick_tag_options, index=0)
+
+        extra_col1, extra_col2, extra_col3 = st.columns([1.9, 0.55, 2.0])
+        if "goods_id_bulk_input" not in st.session_state:
+            st.session_state["goods_id_bulk_input"] = ""
+
+        def clear_goods_id_bulk_input():
+            st.session_state["goods_id_bulk_input"] = ""
+
+        def fill_goods_id_bulk_example():
+            st.session_state["goods_id_bulk_input"] = "商品平台活动信息\n商品 ID\n603182235263112\n602642076000852\n602642076000852"
+
+        with extra_col1:
+            goods_id_input = st.text_area(
+                "Goods ID 批量搜索",
+                key="goods_id_bulk_input",
+                height=108,
+                placeholder="支持直接粘贴原始内容；自动提取数字型 Goods ID，忽略标题文字。",
+            ).strip()
+            st.markdown('<div class="goods-id-help">支持换行、逗号、空格、分号，复制表格原文也可自动提取。</div>', unsafe_allow_html=True)
+        with extra_col2:
+            st.write("")
+            st.write("")
+            st.button("清空输入", use_container_width=True, on_click=clear_goods_id_bulk_input)
+            st.button("粘贴示例", use_container_width=True, on_click=fill_goods_id_bulk_example)
+        with extra_col3:
+            st.caption("单品筛选支持按 Goods ID 或按 SKU 两种模式。SKU 模式新增 Goods ID 联动下拉：可先选 Goods ID，再只看该 Goods 下的 SKU；价格销量走势图按真实 SKU 过滤。")
+
+    raw_goods_ids = extract_goods_ids(goods_id_input)
+
+    if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+    else:
+        start_date, end_date = min_date, max_date
+
+    filtered_df = detail_df[(detail_df["date"].dt.date >= start_date) & (detail_df["date"].dt.date <= end_date)].copy()
+    if selected_store != "全部店铺":
+        filtered_df = filtered_df[filtered_df["store"] == selected_store]
+    selected_product = "全部产品"
+    if product_mode == "按 Goods ID":
+        selected_product = selected_goods_id
+        if selected_goods_id != "全部Goods ID":
+            filtered_df = filtered_df[filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+    elif product_mode == "按 SKU":
+        selected_product = selected_sku
+        selected_goods_ids: list[str] = []
+        if selected_goods_id != "全部Goods ID":
+            selected_goods_ids = [str(selected_goods_id)]
+            filtered_df = filtered_df[filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+        elif not frontend_order_df.empty and {"display_sku", "goods_id"}.issubset(frontend_order_df.columns) and selected_sku != "全部SKU":
+            selected_goods_ids = frontend_order_df.loc[
+                frontend_order_df["display_sku"].astype(str) == str(selected_sku),
+                "goods_id",
+            ].astype(str).dropna().unique().tolist()
+            if selected_goods_ids:
+                filtered_df = filtered_df[filtered_df["goods_id"].astype(str).isin(selected_goods_ids)]
+            else:
+                filtered_df = filtered_df.iloc[0:0].copy()
+        if selected_sku != "全部SKU":
+            if selected_goods_ids:
+                sku_filtered_df = filtered_df[filtered_df["display_sku"].astype(str) == str(selected_sku)]
+                if not sku_filtered_df.empty:
+                    filtered_df = sku_filtered_df
+            elif frontend_order_df.empty:
+                filtered_df = filtered_df[filtered_df["display_sku"].astype(str) == str(selected_sku)]
+
+    match_scope_df = filtered_df.copy()
+    available_goods_ids = set(match_scope_df["goods_id"].astype(str).dropna().tolist())
+    matched_goods_ids = [gid for gid in raw_goods_ids if gid in available_goods_ids]
+    unmatched_goods_ids = [gid for gid in raw_goods_ids if gid not in available_goods_ids]
+    if matched_goods_ids:
+        filtered_df = filtered_df[filtered_df["goods_id"].astype(str).isin(matched_goods_ids)]
+    elif raw_goods_ids:
+        filtered_df = filtered_df.iloc[0:0].copy()
+
+    tag_snapshot = build_tag_snapshot(filtered_df if not filtered_df.empty else detail_df)
+    if selected_tag != "全部标签" and not filtered_df.empty and not tag_snapshot.empty:
+        if selected_tag == "上升趋势品":
+            keep_ids = set(tag_snapshot.loc[tag_snapshot["trend_up"], "goods_id"])
+        elif selected_tag == "核心爆款":
+            keep_ids = set(tag_snapshot.loc[tag_snapshot["core_tag"].isin(["大爆款", "爆款", "旺款"]), "goods_id"])
+        else:
+            keep_ids = set(tag_snapshot.loc[tag_snapshot["display_tag"].str.contains(selected_tag, na=False), "goods_id"])
+        filtered_df = filtered_df[filtered_df["goods_id"].isin(keep_ids)]
+
+    if raw_goods_ids:
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        summary_col1.info(f"已识别 Goods ID：{len(raw_goods_ids)} 个")
+        summary_col2.success(f"命中：{len(matched_goods_ids)} 个")
+        summary_col3.error(f"未命中：{len(unmatched_goods_ids)} 个")
+        if unmatched_goods_ids:
+            with st.expander("查看未命中的 Goods ID"):
+                st.code("\n".join(unmatched_goods_ids), language="text")
+
+    if filtered_df.empty:
+        st.warning("当前筛选条件下没有数据。")
+        st.stop()
+
+    frontend_filtered_df = pd.DataFrame()
+    frontend_scope_text = "全部商品"
+    if not frontend_order_df.empty:
+        frontend_filtered_df = frontend_order_df[(frontend_order_df["date"].dt.date >= start_date) & (frontend_order_df["date"].dt.date <= end_date)].copy()
+        if selected_store != "全部店铺" and "goods_id" in frontend_filtered_df.columns:
+            scoped_goods_ids = set(filtered_df["goods_id"].astype(str).unique().tolist())
+            frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str).isin(scoped_goods_ids)]
+        if product_mode == "按 Goods ID" and selected_goods_id != "全部Goods ID":
+            frontend_scope_text = f"Goods ID：{selected_goods_id}"
+            frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+        elif product_mode == "按 SKU":
+            if selected_goods_id != "全部Goods ID":
+                frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+                frontend_scope_text = f"Goods ID：{selected_goods_id}"
+            if selected_sku != "全部SKU":
+                frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["display_sku"].astype(str) == str(selected_sku)]
+                frontend_scope_text = f"{frontend_scope_text} / SKU：{selected_sku}" if frontend_scope_text != "全部商品" else f"SKU：{selected_sku}"
+
+    daily_df = build_daily_dataset(filtered_df)
+    daily_detail_df = build_daily_detail_dataset(filtered_df)
+    tag_snapshot = build_tag_snapshot(filtered_df)
+    top20, abnormal_sku, unmatched_sku = build_sku_tables(filtered_df)
+    today_alerts, history_alerts, tag_alerts, actions = build_alerts(filtered_df, tag_snapshot, daily_df)
+
+    is_single_goods_selected = product_mode == "按 Goods ID" and selected_goods_id != "全部Goods ID"
+    is_single_sku_selected = product_mode == "按 SKU" and selected_sku != "全部SKU"
+    show_frontend_chart = is_single_goods_selected or is_single_sku_selected
+
+    summary_impressions = filtered_df["impressions"].sum()
+    summary_clicks = filtered_df["clicks"].sum()
+    summary_orders = filtered_df["orders"].sum()
+    summary_sales = filtered_df["sales_amount"].sum()
+    summary_units = filtered_df["units_ordered"].sum()
+    summary_ctr = safe_divide(summary_clicks, summary_impressions)
+    summary_conversion = safe_divide(summary_orders, summary_clicks)
+    days_count = max((pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1, 1)
+    summary_avg_units = summary_units / days_count
+    summary_avg_sales = summary_sales / days_count
+    summary_avg_sales_per_order = safe_divide(summary_sales, summary_orders)
+    summary_avg_units_per_order = safe_divide(summary_units, summary_orders)
+
+    recent7_daily = daily_df.sort_values("date").tail(min(7, len(daily_df))).copy()
+    recent7_days_count = max(len(recent7_daily), 1)
+    recent7_metrics = {
+        "总曝光量": recent7_daily["impressions"].mean() if not recent7_daily.empty else 0,
+        "总点击量": recent7_daily["clicks"].mean() if not recent7_daily.empty else 0,
+        "整体 CTR": recent7_daily["ctr"].mean() if not recent7_daily.empty else 0,
+        "总订单数": recent7_daily["orders"].mean() if not recent7_daily.empty else 0,
+        "整体转化率": recent7_daily["conversion_rate"].mean() if not recent7_daily.empty else 0,
+        "总销售额": recent7_daily["sales_amount"].mean() if not recent7_daily.empty else 0,
+        "总销量": recent7_daily["units_ordered"].mean() if not recent7_daily.empty else 0,
+        "每单销售额": recent7_daily["avg_sales_per_order"].mean() if not recent7_daily.empty else 0,
+        "每单销售量": recent7_daily["avg_units_per_order"].mean() if not recent7_daily.empty else 0,
+        "日均销售额": recent7_daily["sales_amount"].sum() / recent7_days_count if not recent7_daily.empty else 0,
+        "日均销量": recent7_daily["units_ordered"].sum() / recent7_days_count if not recent7_daily.empty else 0,
+    }
+
+    single_goods_id = filtered_df["goods_id"].astype(str).nunique() == 1
+    inventory_qty_single = filtered_df["inventory_qty"].max() if (single_goods_id and "inventory_qty" in filtered_df.columns) else 0
+    library_sales_ratio = safe_divide(inventory_qty_single, summary_avg_units) if single_goods_id else 0
+    recent7_metrics["库销比"] = safe_divide(inventory_qty_single, recent7_metrics["日均销量"]) if single_goods_id else 0
+
+
+    metric_tooltips = {
+        "总曝光量": build_metric_tooltip("当前筛选范围内累计曝光次数。", "筛选范围内按天汇总 impressions 后求和。", f"{recent7_metrics['总曝光量']:,.0f} /日"),
+        "总点击量": build_metric_tooltip("当前筛选范围内累计点击次数。", "筛选范围内按天汇总 clicks 后求和。", f"{recent7_metrics['总点击量']:,.0f} /日"),
+        "整体 CTR": build_metric_tooltip("点击效率，衡量曝光到点击的转化表现。", "总点击量 / 总曝光量 × 100%", format_pct(recent7_metrics['整体 CTR'])),
+        "总订单数": build_metric_tooltip("当前筛选范围内累计订单数。", "筛选范围内按天汇总 orders 后求和。", f"{recent7_metrics['总订单数']:,.1f} /日"),
+        "整体转化率": build_metric_tooltip("点击到下单的整体转化效率。", "总订单数 / 总点击量 × 100%", format_pct(recent7_metrics['整体转化率'])),
+        "总销售额": build_metric_tooltip("当前筛选范围内累计销售额。", "筛选范围内按天汇总 sales_amount 后求和。", f"MX${recent7_metrics['总销售额']:,.2f} /日"),
+        "总销量": build_metric_tooltip("当前筛选范围内累计销量。", "筛选范围内按天汇总 units_ordered 后求和。", f"{recent7_metrics['总销量']:,.1f} /日"),
+        "每单销售额": build_metric_tooltip("平均每笔订单贡献的销售额。", "总销售额 / 总订单数", f"MX${recent7_metrics['每单销售额']:,.2f}"),
+        "每单销售量": build_metric_tooltip("平均每笔订单售出的件数。", "总销量 / 总订单数", f"{recent7_metrics['每单销售量']:,.2f}"),
+        "日均销售额": build_metric_tooltip("当前筛选周期内平均每天的销售额。", "总销售额 / 天数", f"MX${recent7_metrics['日均销售额']:,.2f}"),
+        "日均销量": build_metric_tooltip("当前筛选周期内平均每天的销量。", "总销量 / 天数", f"{recent7_metrics['日均销量']:,.2f}"),
+        "库销比": build_metric_tooltip("单个 Goods ID 当前库存相对日均销量的覆盖倍数，值越高说明库存覆盖天数越长。", "当前库存 / 日均销量", f"{recent7_metrics['库销比']:,.2f}"),
+    }
+
+    metric_row1 = st.columns(5)
+    with metric_row1[0]:
+        render_metric_card("总曝光量", f"{summary_impressions:,.0f}", "flow", tooltip_html=metric_tooltips["总曝光量"])
+    with metric_row1[1]:
+        render_metric_card("总点击量", f"{summary_clicks:,.0f}", "flow", tooltip_html=metric_tooltips["总点击量"])
+    with metric_row1[2]:
+        render_metric_card("整体 CTR", format_pct(summary_ctr), "flow", f"参考 {format_pct(industry_ctr)}", summary_ctr >= industry_ctr, tooltip_html=metric_tooltips["整体 CTR"])
+    with metric_row1[3]:
+        render_metric_card("总订单数", f"{summary_orders:,.0f}", "conv", tooltip_html=metric_tooltips["总订单数"])
+    with metric_row1[4]:
+        render_metric_card("整体转化率", format_pct(summary_conversion), "conv", f"参考 {format_pct(industry_conversion)}", summary_conversion >= industry_conversion, tooltip_html=metric_tooltips["整体转化率"])
+
+    metric_row2 = st.columns(5)
+    with metric_row2[0]:
+        render_metric_card("总销售额", f"MX${summary_sales:,.2f}", "sales", tooltip_html=metric_tooltips["总销售额"])
+    with metric_row2[1]:
+        render_metric_card("总销量", f"{summary_units:,.0f}", "sales", tooltip_html=metric_tooltips["总销量"])
+    with metric_row2[2]:
+        render_metric_card("每单销售额", f"MX${summary_avg_sales_per_order:,.2f}", "sales", tooltip_html=metric_tooltips["每单销售额"])
+    with metric_row2[3]:
+        render_metric_card("每单销售量", f"{summary_avg_units_per_order:,.2f}", "sales", tooltip_html=metric_tooltips["每单销售量"])
+    with metric_row2[4]:
+        render_metric_card("日均销售额", f"MX${summary_avg_sales:,.2f}", "sales", tooltip_html=metric_tooltips["日均销售额"])
+
+    metric_row3 = st.columns(5)
+    with metric_row3[0]:
+        render_metric_card("日均销量", f"{summary_avg_units:,.2f}", "sales", tooltip_html=metric_tooltips["日均销量"])
+    with metric_row3[1]:
+        if single_goods_id:
+            render_metric_card("库销比", f"{library_sales_ratio:,.2f}", "sales", tooltip_html=metric_tooltips["库销比"])
+
+    st.markdown("## 模块 2：每日趋势可视化区")
+    with st.container(border=True):
+        chart1, chart2 = st.columns(2)
+        with chart1:
+            st.plotly_chart(make_impressions_ctr_chart(daily_df, ctr_target=industry_ctr), use_container_width=True)
+        with chart2:
+            st.plotly_chart(make_clicks_conversion_chart(daily_df, conversion_target=industry_conversion), use_container_width=True)
+
+        if show_frontend_chart:
+            if not frontend_filtered_df.empty:
+                frontend_daily_df = build_frontend_daily_dataset(frontend_filtered_df)
+                if not frontend_daily_df.empty:
+                    st.plotly_chart(make_frontend_price_sales_chart(frontend_daily_df), use_container_width=True)
+                    st.caption(f"价格销量走势图口径：{frontend_scope_text}。仅在选中单个 Goods ID 或单个 SKU 后显示。前端价 = 当日 Retail price (tax excl.) 总和 ÷ 当日 quantity purchased 总和 × 1.16；销量 = 当日 quantity purchased 汇总。")
+                else:
+                    st.info("当前单品条件下没有可展示的前端订单数据。")
+            else:
+                st.info("当前单品条件下没有可展示的前端订单数据。")
+        else:
+            st.info("请选择单个 Goods ID 或单个 SKU 后，再查看前端价格与销量走势图。")
+
+    st.markdown("## 模块 3：每日数据明细区")
+    with st.container(border=True):
+        sort_field_map = {
+            "日期": "date",
+            "Goods ID": "goods_id",
+            "SKU": "display_sku",
+            "曝光量": "impressions",
+            "点击量": "clicks",
+            "CTR": "ctr",
+            "订单数": "orders",
+            "转化率": "conversion_rate",
+            "销售额": "sales_amount",
+            "销量": "units_ordered",
+            "买家数": "buyers",
+            "每单销售额": "avg_sales_per_order",
+            "每单销售量": "avg_units_per_order",
+            "客均购买量": "avg_units_per_buyer",
+            "日均销量": "avg_daily_units",
+            "日均销售额": "avg_daily_sales",
+        }
+        sort_col1, sort_col2, sort_col3 = st.columns([1.1, 1.0, 1.8])
+        with sort_col1:
+            sort_field_label = st.selectbox("默认排序字段", list(sort_field_map.keys()), index=0)
+        with sort_col2:
+            sort_order_label = st.selectbox("默认排序方式", ["降序", "升序"], index=0)
+        with sort_col3:
+            st.caption("表格支持直接点击列头二次排序；下方配置用于初始化默认排序。异常行会对 CTR / 转化率 / 订单数 / 异常原因做红字提示。")
+        ascending = sort_order_label == "升序"
+        sort_columns = [sort_field_map[sort_field_label], "date", "goods_id", "display_sku"]
+        ascending_list = [ascending] + [False if c == "date" else True for c in sort_columns[1:]]
+        table_df = daily_detail_df.sort_values(sort_columns, ascending=ascending_list).copy()
+        show_df = table_df.copy()
+        show_df["日期"] = show_df["date"].dt.strftime("%Y-%m-%d")
+        show_df["Goods ID"] = show_df["goods_id"].astype(str)
+        show_df["SKU"] = show_df["display_sku"].astype(str)
+        show_df["曝光量"] = show_df["impressions"].map(lambda x: f"{x:,.0f}")
+        show_df["点击量"] = show_df["clicks"].map(lambda x: f"{x:,.0f}")
+        show_df["CTR"] = show_df["ctr"].apply(format_pct)
+        show_df["订单数"] = show_df["orders"].map(lambda x: f"{x:,.0f}")
+        show_df["转化率"] = show_df["conversion_rate"].apply(format_pct)
+        show_df["销售额"] = show_df["sales_amount"].map(lambda x: f"MX${x:,.2f}")
+        show_df["销量"] = show_df["units_ordered"].map(lambda x: f"{x:,.0f}")
+        show_df["买家数"] = show_df["buyers"].map(lambda x: f"{x:,.0f}")
+        show_df["每单销售额"] = show_df["avg_sales_per_order"].map(lambda x: f"MX${x:,.2f}")
+        show_df["每单销售量"] = show_df["avg_units_per_order"].map(lambda x: f"{x:,.2f}")
+        show_df["客均购买量"] = show_df["avg_units_per_buyer"].map(lambda x: f"{x:,.2f}")
+        show_df["日均销量"] = show_df["avg_daily_units"].map(lambda x: f"{x:,.2f}")
+        show_df["日均销售额"] = show_df["avg_daily_sales"].map(lambda x: f"MX${x:,.2f}")
+        show_df = show_df.rename(columns={"anomaly_reason": "异常原因"})
+        show_df = show_df[["日期", "Goods ID", "SKU", "曝光量", "点击量", "CTR", "订单数", "转化率", "销售额", "销量", "买家数", "每单销售额", "每单销售量", "客均购买量", "日均销量", "日均销售额", "异常原因"]]
+        st.caption("SKU 优先显示；若商品信息表缺少 SKU，则自动回退显示 Goods ID。导出文件额外附带字段说明页。")
+        st.dataframe(style_daily_detail_table(show_df), use_container_width=True)
+
+        st.download_button(
+            label="导出当前筛选结果 Excel",
+            data=build_export_file(table_df),
+            file_name="营销数据看板_每日明细增强版.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.markdown("## 模块 4：SKU 流量销售联动分析区")
+    with st.container(border=True):
+        sku_col1, sku_col2, sku_col3 = st.columns(3)
+        with sku_col1:
+            st.markdown("**SKU 综合表现 TOP20**")
+            top_cols = pick_existing_columns(top20, ["store", "display_sku", "goods_id", "impressions", "clicks", "ctr", "orders", "sales_amount", "units_ordered", "avg_sales_per_order"])
+            top_show = top20[top_cols].copy() if not top20.empty else pd.DataFrame(columns=top_cols)
+            if "ctr" in top_show.columns:
+                top_show["ctr"] = top_show["ctr"].apply(format_pct)
+            top_show = top_show.rename(columns={"store": "店铺", "display_sku": "SKU", "goods_id": "Goods ID", "impressions": "曝光量", "clicks": "点击量", "ctr": "CTR", "orders": "订单数", "sales_amount": "销售额", "units_ordered": "销量", "avg_sales_per_order": "每单销售额"})
+            st.dataframe(top_show, use_container_width=True, hide_index=True)
+        with sku_col2:
+            st.markdown("**异常 SKU 榜**")
+            abnormal_cols = pick_existing_columns(abnormal_sku, ["abnormal_type", "store", "display_sku", "goods_id", "impressions", "clicks", "ctr", "orders", "conversion_rate", "units_ordered", "sales_amount", "inventory_qty"])
+            abnormal_show = abnormal_sku[abnormal_cols].copy() if not abnormal_sku.empty else pd.DataFrame(columns=abnormal_cols)
+            for pct_col in ["ctr", "conversion_rate"]:
+                if pct_col in abnormal_show.columns:
+                    abnormal_show[pct_col] = abnormal_show[pct_col].apply(format_pct)
+            abnormal_show = abnormal_show.rename(columns={"abnormal_type": "异常类型", "store": "店铺", "display_sku": "SKU", "goods_id": "Goods ID", "impressions": "曝光量", "clicks": "点击量", "ctr": "CTR", "orders": "订单数", "conversion_rate": "转化率", "units_ordered": "销量", "sales_amount": "销售额", "inventory_qty": "库存余量"})
+            st.dataframe(abnormal_show, use_container_width=True, hide_index=True)
+        with sku_col3:
+            st.markdown("**未联动 SKU 明细**")
+            unmatched_cols = pick_existing_columns(unmatched_sku, ["unmatched_type", "store", "display_sku", "goods_id", "impressions", "clicks", "ctr", "orders", "sales_amount", "units_ordered", "inventory_qty"])
+            unmatched_show = unmatched_sku[unmatched_cols].copy() if not unmatched_sku.empty else pd.DataFrame(columns=unmatched_cols)
+            if "ctr" in unmatched_show.columns:
+                unmatched_show["ctr"] = unmatched_show["ctr"].apply(format_pct)
+            unmatched_show = unmatched_show.rename(columns={"unmatched_type": "类型", "store": "店铺", "display_sku": "SKU", "goods_id": "Goods ID", "impressions": "曝光量", "clicks": "点击量", "ctr": "CTR", "orders": "订单数", "sales_amount": "销售额", "units_ordered": "销量", "inventory_qty": "库存余量"})
+            st.dataframe(unmatched_show, use_container_width=True, hide_index=True)
+
+    st.markdown("## 模块 5：API 高级维度与自动诊断区")
+    with st.container(border=True):
+        if not has_advanced_api_data:
+            st.info("暂无高级 API 扩展数据。填写侧边栏的高级 API 接口 type 后，可自动分析加购、库存、退款、价格、成本等指标。")
+        else:
+            dimension_summary = build_dimension_summary(advanced_df)
+            diagnostic_actions = build_diagnostic_actions(dimension_summary)
+            adv_kpi1, adv_kpi2, adv_kpi3, adv_kpi4, adv_kpi5 = st.columns(5)
+            adv_kpi1.metric("加购数", f"{advanced_df['add_to_cart'].sum():,.0f}")
+            adv_kpi2.metric("加购率", format_pct(safe_divide(advanced_df['add_to_cart'].sum(), advanced_df['clicks'].sum())))
+            adv_kpi3.metric("退款金额", f"MX${advanced_df['refund_amount'].sum():,.2f}")
+            adv_kpi4.metric("退款订单率", format_pct(safe_divide(advanced_df['refund_orders'].sum(), advanced_df['signed_orders'].sum())))
+            adv_kpi5.metric("毛利率", format_pct(safe_divide(advanced_df['gross_profit'].sum(), advanced_df['sales_amount'].sum())))
+
+            adv_tab1, adv_tab2, adv_tab3 = st.tabs(["商品细维度", "自动诊断", "高级原始指标"])
+            with adv_tab1:
+                show_cols = ["store", "display_sku", "goods_id", "impressions", "clicks", "ctr", "add_to_cart", "cart_rate", "orders", "conversion_rate", "refund_orders", "refund_order_rate", "inventory_qty", "sellable_days", "gross_profit", "gross_margin"]
+                show_cols = [c for c in show_cols if c in dimension_summary.columns]
+                dim_show = dimension_summary[show_cols].head(200).copy()
+                for pct_col in ["ctr", "cart_rate", "conversion_rate", "refund_order_rate", "gross_margin"]:
+                    if pct_col in dim_show.columns:
+                        dim_show[pct_col] = dim_show[pct_col].apply(format_pct)
+                dim_show = dim_show.rename(columns={
+                    "store": "店铺", "display_sku": "SKU", "goods_id": "Goods ID", "impressions": "曝光", "clicks": "点击", "ctr": "CTR",
+                    "add_to_cart": "加购", "cart_rate": "加购率", "orders": "订单", "conversion_rate": "转化率",
+                    "refund_orders": "退款订单", "refund_order_rate": "退款订单率", "inventory_qty": "库存", "sellable_days": "可售天数",
+                    "gross_profit": "毛利", "gross_margin": "毛利率",
+                })
+                st.dataframe(dim_show, use_container_width=True, hide_index=True)
+            with adv_tab2:
+                if diagnostic_actions.empty:
+                    st.success("当前没有触发高优先级诊断。")
+                else:
+                    st.dataframe(diagnostic_actions, use_container_width=True, hide_index=True)
+            with adv_tab3:
+                raw_cols = ["date", "store", "display_sku", "goods_id", "visitors", "impressions", "clicks", "add_to_cart", "orders", "paid_orders", "refund_orders", "refund_units", "refund_amount", "inventory_qty_api", "front_price", "supply_price", "gross_profit", "sellable_days"]
+                raw_cols = [c for c in raw_cols if c in advanced_df.columns]
+                st.dataframe(advanced_df[raw_cols].sort_values(["date", "goods_id"], ascending=[False, True]).head(500), use_container_width=True, hide_index=True)
+
+    st.markdown("## 模块 6：异常提示与行动指引区")
+    with st.container(border=True):
+        analysis_texts = build_analysis_text(daily_df, industry_ctr, industry_conversion)
+        alert_col1, alert_col2 = st.columns(2)
+        with alert_col1:
+            st.markdown("**今日异常总览**")
+            if today_alerts:
+                for item in today_alerts:
+                    st.warning(item)
+            else:
+                st.info("今日未识别到明显异常。")
+            st.markdown("**标签维度预警**")
+            if tag_alerts:
+                for item in tag_alerts[:6]:
+                    st.error(item)
+            else:
+                st.success("当前没有明显的标签预警。")
+        with alert_col2:
+            st.markdown("**历史异常复盘**")
+            if history_alerts:
+                for item in history_alerts[:7]:
+                    st.write(f"- {item}")
+            else:
+                st.write("近7天无明显历史异常。")
+            st.markdown("**运营行动建议**")
+            all_actions = analysis_texts + actions
+            if all_actions:
+                for item in all_actions[:6]:
+                    st.write(f"- {item}")
+            else:
+                st.write("当前无需额外动作建议。")
+
+
+    st.markdown("## 模块 7：产品售后监控 - SKU退货退款统计")
+    with st.container(border=True):
+        if return_df.empty:
+            st.info("上传售后退货报表后，可按店铺、SKU ID、售后单状态、申请理由、申请日期范围和一级原因筛选，并导出当前筛选结果。")
+        else:
+            return_min_dt = return_df["requested_date"].dropna().min()
+            return_max_dt = return_df["requested_date"].dropna().max()
+            if pd.isna(return_min_dt) or pd.isna(return_max_dt):
+                return_min_date, return_max_date = min_date, max_date
+            else:
+                return_min_date, return_max_date = return_min_dt.date(), return_max_dt.date()
+
+            r_filter1, r_filter2, r_filter3 = st.columns([1.0, 1.4, 1.6])
+            with r_filter1:
+                return_store_options = ["全部店铺"] + sorted({s for s in return_df["store"].dropna().astype(str).tolist() if s.strip() and s.strip().casefold() not in {"nan", "none", "null", "<na>"}})
+                return_selected_store = st.selectbox("售后店铺", return_store_options, index=0)
+            with r_filter2:
+                return_date_range = st.date_input("申请日期范围", value=(return_min_date, return_max_date), min_value=return_min_date, max_value=return_max_date, key="return_date_range")
+            with r_filter3:
+                return_search_text = st.text_input("精确查询", placeholder="输入订单ID / 售后单ID / SKU ID / 运单号 / 申请理由关键词")
+
+            if isinstance(return_date_range, tuple) and len(return_date_range) == 2:
+                return_start_date, return_end_date = return_date_range
+            else:
+                return_start_date, return_end_date = return_min_date, return_max_date
+
+            scoped_return_for_options = filter_return_df(return_df, store=return_selected_store, start_date=return_start_date, end_date=return_end_date)
+            r_filter4, r_filter5, r_filter6, r_filter7 = st.columns([1.3, 1.15, 1.6, 1.2])
+            with r_filter4:
+                sku_id_options = sorted(scoped_return_for_options["sku_id"].dropna().astype(str).unique().tolist())
+                selected_return_skus = st.multiselect("SKU ID", sku_id_options, default=[])
+            with r_filter5:
+                selected_return_statuses = st.multiselect("售后单状态", ["尚未退款", "已退款", "已拒绝"], default=[])
+            with r_filter6:
+                reason_options = sorted(scoped_return_for_options["reason_for_request"].dropna().astype(str).loc[lambda x: x.str.strip() != ""].unique().tolist())
+                selected_return_reasons = st.multiselect("申请理由", reason_options, default=[])
+            with r_filter7:
+                selected_first_reasons = st.multiselect("一级原因", ["配送问题", "客户问题", "发货问题", "产品问题", "配送和产品问题", "其他"], default=[])
+
+            return_filtered_df = filter_return_df(
+                return_df,
+                store=return_selected_store,
+                sku_ids=selected_return_skus,
+                statuses=selected_return_statuses,
+                reasons=selected_return_reasons,
+                first_reasons=selected_first_reasons,
+                start_date=return_start_date,
+                end_date=return_end_date,
+                search_text=return_search_text,
+            )
+            return_summary = build_return_summary(return_filtered_df, detail_df, start_date=return_start_date, end_date=return_end_date, store=return_selected_store)
+
+            kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+            kpi1.metric("退款金额", f"MX${return_summary['refund_amount']:,.2f}")
+            kpi2.metric("退货退款订单数", f"{return_summary['return_order_count']:,}")
+            kpi3.metric("退货退款件数", f"{return_summary['return_unit_count']:,.0f}")
+            kpi4.metric("订单维度退货率", format_pct(return_summary["order_return_rate"]))
+            kpi5.metric("产品件数退货率", format_pct(return_summary["unit_return_rate"]))
+            signed_caption_prefix = "退货率分母来自当前项目销售数据中的已签收订单"
+            signed_caption_suffix = ""
+            if not return_summary.get("signed_status_available", False):
+                signed_caption_suffix = " 当前销售表未识别到订单/物流状态字段，无法严格筛出已签收，系统暂按销售表总量作为分母。"
+            st.caption(
+                f"{signed_caption_prefix}：已签收订单数 {return_summary['sales_order_count']:,.0f}，"
+                f"已签收销售件数 {return_summary['sales_unit_count']:,.0f}。"
+                f"若售后 SKU ID 能与销售明细 SKU 匹配，系统会自动缩小分母到对应 SKU。"
+                f"{signed_caption_suffix}"
+            )
+
+            display_return_df = format_return_display_df(return_filtered_df, return_summary)
+            sortable_return_fields = ["申请日期", "下单日期", "店铺", "SKU ID", "售后单状态", "申请理由", "一级原因", "退货数量", "申请退款金额", "退还给买家的金额", "订单维度 退货率", "产品件数 退货率", "退款金额", "退货退款订单数", "退货退款件数"]
+            sortable_return_fields = [c for c in sortable_return_fields if c in display_return_df.columns]
+            sort_col_a, sort_col_b, sort_col_c = st.columns([1.2, 1.0, 2.0])
+            with sort_col_a:
+                return_sort_field = st.selectbox("售后表排序字段", sortable_return_fields, index=0)
+            with sort_col_b:
+                return_sort_order = st.selectbox("售后表排序方式", ["降序", "升序"], index=0)
+            with sort_col_c:
+                st.caption("蓝色指标字段可按需拆分汇总；当前表格展示当前筛选范围内的 KPI 值，导出 Excel 会附带字段说明页。")
+
+            if not display_return_df.empty and return_sort_field:
+                sort_series = display_return_df[return_sort_field].astype(str)
+                if return_sort_field in {"申请退款金额", "退还给买家的金额", "退款金额"}:
+                    sort_series = pd.to_numeric(sort_series.str.replace("MX$", "", regex=False).str.replace(",", "", regex=False), errors="coerce")
+                elif return_sort_field in {"订单维度 退货率", "产品件数 退货率"}:
+                    sort_series = pd.to_numeric(sort_series.str.replace("%", "", regex=False), errors="coerce")
+                elif return_sort_field in {"退货数量", "退货退款订单数", "退货退款件数"}:
+                    sort_series = pd.to_numeric(sort_series.str.replace(",", "", regex=False), errors="coerce")
+                else:
+                    sort_series = sort_series.fillna("")
+                display_return_df = display_return_df.assign(_sort_key=sort_series).sort_values("_sort_key", ascending=(return_sort_order == "升序"), na_position="last").drop(columns=["_sort_key"])
+
+            st.dataframe(display_return_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                label="导出售后退货统计 Excel",
+                data=build_return_export_file(display_return_df),
+                file_name="售后退货监控_SKU退货退款统计.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with st.expander("Goods ID 匹配检查"):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("销售表Goods ID数", match_summary["销售表Goods ID数"])
+        c2.metric("流量表Goods ID数", match_summary["流量表Goods ID数"])
+        c3.metric("销售表未映射数", match_summary["销售表未映射数"])
+        c4.metric("流量表未映射数", match_summary["流量表未映射数"])
+        d1, d2 = st.columns(2)
+        d1.metric("销售有但流量没有", match_summary["销售有但流量没有"])
+        d2.metric("流量有但销售没有", match_summary["流量有但销售没有"])
+        if match_details["traffic_not_in_sales"]:
+            st.markdown("**流量表有但销售表没有的 Goods ID**")
+            st.dataframe(pd.DataFrame({"Goods ID": match_details["traffic_not_in_sales"]}), use_container_width=True, hide_index=True)
+        if match_details["sales_not_in_traffic"]:
+            st.markdown("**销售表有但流量表没有的 Goods ID**")
+            st.dataframe(pd.DataFrame({"Goods ID": match_details["sales_not_in_traffic"]}), use_container_width=True, hide_index=True)
+
+    with st.expander("字段说明"):
+        st.markdown("""
+    - 匹配键统一使用 **Goods ID**
+    - 展示字段统一使用 **SKU**，未匹配时回退显示 Goods ID
+    - 产品筛选仅显示 **SKU / Goods ID**，不使用 **Product name / Goods Name**
+    - 每日明细已去掉“每点击销售额、每千曝光销售额”，改为销量、日均销量、日均销售额、每单销售量、每单销售额
+    """)
